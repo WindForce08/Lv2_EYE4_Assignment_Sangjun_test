@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -8,7 +9,7 @@ extern "C" int CDC_Itf_Write(uint8_t*p,uint32_t n){messages.emplace_back((char*)
 void reset(){
  dxl=DynamixelWorkbench();fakeNow=0;Serial.input.clear();messages.clear();
  ready=holding=armed=faulted=stopping=baseline=false;known[0]=known[1]=false;
- for(int i=0;i<2;++i){pos[i]=vel[i]=torque[i]=goal[i]=previous[i]=holdAnchor[i]=0;}
+ for(int i=0;i<2;++i){pos[i]=vel[i]=torque[i]=goal[i]=previous[i]=holdAnchor[i]=speedCap[i]=0;}
  origin[0]=3078;origin[1]=0;lastCommand=lastPoll=sampleAt=stopAt=0;
  quiet=0;used=0;discardLine=false;setup();
 }
@@ -41,6 +42,27 @@ int main(){
  for(int p=3100;p<=4420;p+=20){send("VEL .048 0\n");dxl.regs[{11,"Present_Position"}]=p;advance(25);}
  dxl.regs[{11,"Present_Position"}]=4423; advance(25);
  assert(armed&&!faulted&&goal[0]==0);advance(150);assert(!stopping);
+ // Edge stop names the axis and blocked direction, keeps ARM, and answers the triggering VEL (no ACK VEL).
+ reset();prepared();send("ARM\n");messages.clear();
+ for(int p=3098;p<=4378;p+=20){dxl.regs[{11,"Present_Position"}]=p;send("VEL .048 0\n");advance(25);}
+ assert(armed&&!faulted&&!stopping&&goal[0]==2);                 // 4378-3078=1300 < STOP 1305
+ dxl.regs[{11,"Present_Position"}]=4390;messages.clear();send("VEL .048 0\n");
+ assert(messages.size()==1&&messages[0]=="EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN DIR=+1\n");
+ assert(armed&&stopping&&goal[0]==0);
+ messages.clear();send("VEL -.048 0\n");assert(messages.back()=="ERR STOPPING\n");   // host must wait for the stop
+ advance(150);assert(armed&&!stopping);send("VEL -.048 0\n");assert(goal[0]==-2&&messages.back()=="ACK VEL\n");
+ // Tilt edge from the periodic check while moving down (negative raw direction).
+ reset();prepared();send("ARM\nVEL 0 -.048\n");messages.clear();
+ for(int p=4076;p>=3456;p-=20){dxl.regs[{12,"Present_Position"}]=p;send("VEL 0 -.048\n");advance(25);if(stopping)break;}
+ assert(std::find(messages.begin(),messages.end(),"EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=TILT DIR=-1\n")!=messages.end());
+ assert(armed&&!faulted);
+ // 0.5 rad/s (21 raw units) is accepted and is not UNEXPECTED_SPEED; running faster than commanded is.
+ reset();prepared();send("ARM\nVEL 0.5 -0.5\n");assert(goal[0]==21&&goal[1]==-21);
+ for(int i=0;i<4;++i){send("VEL 0.5 -0.5\n");advance(25);}assert(armed&&!faulted);
+ send("VEL 0.51 0\n");assert(messages.back()=="ERR RANGE\n"&&goal[0]==21);
+ send("VEL 0.05 0\n");dxl.regs[{11,"Present_Velocity"}]=20;advance(25);assert(!faulted&&goal[0]==2);  // decelerating
+ dxl.regs[{11,"Present_Velocity"}]=2;advance(25);                                                    // settled
+ dxl.regs[{11,"Present_Velocity"}]=9;advance(25);assert(faulted);                                   // 9 > 2+SPEED_MARGIN
  // Initial tilt pose may be represented as 0 or 4096 after reboot.
  reset();dxl.regs[{12,"Present_Position"}]=0;prepared();assert(origin[1]==0);
  // A reset during holding is a fault, not a silently wrapped reading.

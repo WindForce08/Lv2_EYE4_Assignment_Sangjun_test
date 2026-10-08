@@ -13,6 +13,7 @@ control_node:
     recovery_frames: 3
     pan_direction: -1
     tilt_direction: 1
+    search_enabled: false   # 문제 2 모의 입력: 미검출·침묵에서 계속 정지해야 기대 결과와 같음
 opencr_node:
   ros__parameters:
     dry_run: true

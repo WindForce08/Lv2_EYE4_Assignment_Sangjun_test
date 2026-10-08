@@ -16,13 +16,18 @@ DRY / LIVE
   BOOT --prepare()--> CHECKING → HOLDING → WAIT_HOLD → VERIFY_READY → READY   (토크 ON, 속도 0)
   READY --arm()--> ARMING → VERIFY_ARM → ARMED   (신선한 stop=false 명령이 있을 때만, 자동 ARM 없음)
   ARMED: 신선한 명령마다 VEL 또는 STOP 1회 전송. stop=true는 STOP(논리적 ARM 유지, 정상 목표 소실용)
+  ARMED 중 보드 경계 정지 "EVENT LIMIT STOPPED … AXIS=PAN|TILT DIR=±1": FAULT가 아니다. 보드가 두 축을 멈추고
+    ARM을 유지한 것이므로 STOP과 같은 정지 확인 흐름(STATUS로 ARMED·영속도 확인 → VEL 재개)을 탄다.
+    이 이벤트가 대기 중인 VEL의 응답이므로 VEL 대기를 해제하고, 경계 직후 도착하는 그 VEL의 "ERR STOPPING" 1건은
+    무시한다. 축·방향은 limit_events로 넘겨 opencr_node가 /opencr/limit으로 발행한다 (control_node 탐색 반환점).
   ARMED/READY --disarm()--> DISARMING → WAIT_DISARM → VERIFY_DISARM → READY
   어떤 단계든 이상 → FAULT (래치). 자동 재연결·자동 재ARM 없음. 새 세션은 보드 reset 후 prepare부터.
 
 FAULT가 되는 경우 (모두 시험됨: test/test_serial_core.py)
   - ROS 명령이 COMMAND_AGE(기본 0.15초) 넘게 끊김 / 오래된·역순·범위 밖 명령 (ARM 중)
   - 보드 응답 ACK 미수신, STATUS 0.4초 미수신, 보드 피드백 나이 100 ms 초과, 보드 재부팅
-  - 보드 EVENT TIMEOUT / EVENT LIMIT / FAULT / ERR, 형식이 깨진 응답, 시리얼 읽기·쓰기 오류
+  - 보드 EVENT TIMEOUT / EVENT LIMIT DISARMED(이전 펌웨어) / ARMED가 아닐 때의 EVENT LIMIT / FAULT / ERR,
+    형식이 깨진 응답, 시리얼 읽기·쓰기 오류
   FAULT 시 보드가 MODE 확인된 상태면 DISARM을 한 번 시도한다 (best effort, 토크 유지).
   최종 안전은 펌웨어의 300 ms 명령 timeout과 모터 Bus_Watchdog이 보장한다 (bridge가 죽어도 동작).
 """
@@ -98,6 +103,8 @@ class PosixSerial:
         if self.fd is not None:os.close(self.fd);self.fd = None
 
 
+LIMIT_PATTERN = re.compile(r'^EVENT LIMIT STOPPED ZERO_REQUESTED(?: AXIS=(PAN|TILT) DIR=([+-]1))?$')
+
 PATTERN = re.compile(
     r'^STATE (BOOT|READY|STOPPING|DISARMED|ARMED|FAULT) MODE=(DRY|LIVE) '
     r'ARMED=([01]) GOAL=(-?\d+),(-?\d+) POS=(-?\d+),(-?\d+) '
@@ -135,6 +142,9 @@ class SerialBridge:
         self.last_stamp=None;self.latest=None;self.sequence=0;self.sent_sequence=0
         self.stopping=False;self.previous_goal=(0,0);self.closed=False
         self.phase_deadline=None;self.last_command_tx=0.0
+        self.limit_events=[]          # (axis 'pan'|'tilt'|'unknown', 원시 방향 +1|-1|0) — opencr_node가 꺼내 발행
+        self.limit_count=0;self.last_limit=None
+        self.stopping_err_allowed=False  # 경계 정지와 엇갈린 VEL의 ERR STOPPING 1건 허용
         self.send('STATUS', 'STATUS')
 
     def emit(self, direction, line):self.log(self.clock(), direction, line)
@@ -209,7 +219,9 @@ class SerialBridge:
         self.mode_verified=True;self.board=board;self.last_status=self.clock()
         if board['state']=='FAULT':self.fail('BOARD_FAULT: original reason may be unavailable');return
         status_response = bool(self.pending and self.pending[0]=='STATUS')
-        if status_response:self.pending=None
+        if status_response:
+            self.pending=None
+            self.stopping_err_allowed=False  # 그 VEL의 응답은 이 STATUS 응답보다 먼저 온다
         if self.phase=='CONNECTING':
             if board['state']!='BOOT' or board['armed'] or board['torque']!=(0,0):
                 self.fail('STARTUP_NOT_BOOT: reset board, no session adoption');return
@@ -237,13 +249,31 @@ class SerialBridge:
         if self.phase in ('READY','ARMED') and board['age_ms']>100:
             self.fail('STALE_BOARD_FEEDBACK')
 
+    def on_limit_stop(self, line):
+        """보드가 경계에서 두 축을 멈추고 ARM을 유지했다 → STOP과 같은 정지 확인 흐름으로 이어 간다."""
+        match=LIMIT_PATTERN.fullmatch(line)
+        if not match or self.phase!='ARMED':
+            self.fail('BOARD_'+line);return
+        axis=match.group(1).lower() if match.group(1) else 'unknown'
+        sign=int(match.group(2)) if match.group(2) else 0
+        self.limit_count+=1;self.last_limit=(axis,sign)
+        self.limit_events.append((axis,sign))
+        self.stopping=True;self.previous_goal=(0,0)
+        if self.pending and self.pending[0]=='VEL':
+            # The board answers the VEL that hit the edge with this event instead of ACK VEL.
+            # If the edge came from its periodic check instead, the in-flight VEL is answered with ERR STOPPING.
+            self.pending=None;self.stopping_err_allowed=True
+
     def on_line(self, line):
         self.emit('RX',line)
         if self.phase=='FAULT':return
         if line.startswith('FAULT '):self.fail('BOARD_'+line);return
+        if line.startswith('EVENT LIMIT STOPPED'):self.on_limit_stop(line);return
         if line.startswith('EVENT TIMEOUT') or line.startswith('EVENT LIMIT'):
             self.fail('BOARD_'+line);return
         if line.startswith('STATE '):self.on_state(line);return
+        if line=='ERR STOPPING' and self.stopping_err_allowed:
+            self.stopping_err_allowed=False;self.emit('IGNORED','ERR STOPPING for the VEL crossed by a limit stop');return
         if line.startswith('ERR '):self.fail('BOARD_'+line);return
         if line=='EVENT STOPPED TORQUE_RETAINED':
             # Do not unlock normal VEL here: this event may predate a newer STOP.
@@ -326,6 +356,7 @@ class SerialBridge:
     def snapshot(self):
         return dict(phase=self.phase,reason=self.reason,serial_opened=not self.closed,
                     expected_mode=self.expected_mode,board=self.board,
+                    limit_count=self.limit_count,last_limit=self.last_limit,
                     board_receipt_age_sec=None if self.last_status is None else self.clock()-self.last_status)
 
     def close(self):

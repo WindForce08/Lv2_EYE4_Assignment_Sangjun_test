@@ -10,15 +10,27 @@
 #   Kp A/B 세트는 lv2_module5/config/test.yaml에 시험 전에 기록하고, 시험 시 -p kp_pan:=... 로 바꿔 실행한다.
 control_node:
   ros__parameters:
-    kp_pan: 0.3                 # rad/s per 1.0 ex  (2026-10-07 운영자 지정 0.1→0.3: ex=1에서 상한 0.3 rad/s. TODO: Kp A/B 시험 후 최종값 기록)
-    kp_tilt: 0.3                # rad/s per 1.0 ey  (2026-10-07 운영자 지정 0.1→0.3. TODO: Kp A/B 시험 후 최종값 기록)
-    # 속도 상한: 펌웨어 MAX_RAD_S(0.3 rad/s) 이하만 허용 (초과 시 노드 시작 거부)
-    pan_speed_limit_rad_s: 0.10
-    tilt_speed_limit_rad_s: 0.10
+    kp_pan: 1.0                 # rad/s per 1.0 ex  (2026-10-08 추적 속도 0.5 rad/s 요구: |ex| >= 0.5에서 상한 도달. TODO: Kp A/B 시험 후 최종값 기록)
+    kp_tilt: 1.0                # rad/s per 1.0 ey  (같은 이유. TODO: Kp A/B 시험 후 최종값 기록)
+    # 추적 속도 상한 0.5 rad/s = 펌웨어 MAX_RAD_S = control_core.MAX_VELOCITY_RAD_S (넘으면 노드 시작 거부)
+    pan_speed_limit_rad_s: 0.5
+    tilt_speed_limit_rad_s: 0.5
     pan_deadband: 0.03          # |ex| 이하이면 Pan 0 (중심 떨림 방지)
     tilt_deadband: 0.03         # |ey| 이하이면 Tilt 0
     target_timeout_sec: 0.5     # 발제문 기본값. 바꾸면 이유를 report에 기록
     recovery_frames: 3          # LOST → TRACKING 복귀에 필요한 연속 신선 검출 프레임 수
+    # 목표가 없을 때 탐색 (SEARCHING) — control_core.py 상단 "상태 전이·탐색 패턴" 참고
+    #   LOST(정지)로 search_delay_sec 기다린 뒤 Pan·Tilt 최대 범위를 훑는다. 범위 끝은 펌웨어 경계 정지 이벤트(/opencr/limit).
+    #   찾으면 3프레임 후 TRACKING, 못 찾으면(패턴 완료·search_timeout) 정지하고 IDLE.
+    #   추적 중 경계 정지(범위 초과) → 탐색, 다시 찾은 목표가 또 범위를 넘으면 IDLE(out_of_range).
+    #   입력 자체가 끊긴 timeout에서는 탐색하지 않는다. /control/enable false로 취소.
+    search_enabled: true
+    search_delay_sec: 3.0       # 발제 필수 시험(2 s 가림 후 시야 내 재등장 복귀)보다 길게. 바꾸면 이유를 report에 기록
+    search_speed_rad_s: 0.4     # 탐색 속도 (추적 상한 이하). 0.3이면 전체 탐색 ≈114 s (2026-10-08 폐루프 시뮬레이션)
+    search_tilt_step_rad: 0.5   # 한 줄 훑은 뒤 Tilt 이동량 (D435 수직 화각 약 0.73 rad보다 작게 — 줄 사이 빈틈 없음)
+    search_leg_timeout_sec: 20.0  # 경계 이벤트 없이 한 방향 최대 시간 (Pan 전체 ≈4.0 rad ÷ 0.4 ≈ 10 s)
+    search_timeout_sec: 120.0   # 탐색 전체 시간 상한 → IDLE (전체 패턴 ≈ LOCAL 1.5줄 + Tilt 끝 + 5줄)
+    track_stable_sec: 5.0       # 이 시간 이상 범위 안에서 추적하면 경계 재탐색 기회 초기화
     # 영상 오차 부호 → 모터 원시 속도 부호. 여기서 한 번만 적용 (bridge·펌웨어는 다시 곱하지 않음)
     # 근거: 2026-10-07 재조립 후 실측 (카메라가 바라보는 방향 기준, 모터 원시 속도 명령 = 펌웨어 VEL = 엔코더 증가 방향)
     #   Pan  양의 명령 = 좌측 (재조립 전과 같음)

@@ -26,6 +26,8 @@ class SerialTests(unittest.TestCase):
         self.line(state('DISARMED',torque='1,1',mode=self.mode));self.assertEqual(self.bridge.phase,'READY')
     def command(self,p=.048,t=0,stop=False,stamp=1_000_000_000,now=1_000_000_000):
         return self.bridge.receive_command(stop,p,t,stamp,now)
+    def poll(self):
+        if not self.bridge.pending:self.bridge.send('STATUS','STATUS')
     def armed(self):
         self.prepared();self.command();self.assertTrue(self.bridge.arm()[0])
         self.line('ACK ARM');self.line(state('ARMED',1,torque='1,1',mode=self.mode))
@@ -149,6 +151,40 @@ class SerialTests(unittest.TestCase):
         self.line(state('ARMED',1,torque='1,1',mode=self.mode));self.assertFalse(self.bridge.stopping)
         self.command(-.04,0,stamp=3_000_000_000,now=3_000_000_000)
         self.bridge.tick();self.assertEqual(self.io.tx[-1],'VEL -0.040000 0.000000')
+    def test_limit_stop_answers_vel_keeps_arm_and_resumes_after_status(self):
+        self.armed();self.assertEqual(self.bridge.pending[0],'VEL')   # VEL sent once ARMED was confirmed
+        self.line('EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN DIR=+1')
+        self.assertEqual(self.bridge.phase,'ARMED');self.assertIsNone(self.bridge.pending)
+        self.assertTrue(self.bridge.stopping);self.assertEqual(self.bridge.limit_events,[('pan',1)])
+        self.assertEqual(self.bridge.snapshot()['last_limit'],('pan',1))
+        self.assertNotIn('DISARM',self.io.tx)
+        # Inward command while the board is still stopping: no VEL until a newer STATUS confirms the stop.
+        self.command(-.04,0,stamp=2_000_000_000,now=2_000_000_000);self.bridge.tick()
+        self.assertFalse(self.io.tx[-1].startswith('VEL -'))
+        self.poll()
+        self.line(state('STOPPING',1,torque='1,1',mode=self.mode));self.assertTrue(self.bridge.stopping)
+        self.line('EVENT STOPPED TORQUE_RETAINED')
+        self.poll()
+        self.line(state('ARMED',1,torque='1,1',mode=self.mode,t=20));self.assertFalse(self.bridge.stopping)
+        self.command(-.04,0,stamp=3_000_000_000,now=3_000_000_000);self.bridge.tick()
+        self.assertEqual(self.io.tx[-1],'VEL -0.040000 0.000000');self.assertEqual(self.bridge.phase,'ARMED')
+    def test_limit_stop_crossing_vel_err_stopping_ignored_once(self):
+        self.armed()
+        self.line('EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=TILT DIR=-1')
+        self.line('ERR STOPPING');self.assertEqual(self.bridge.phase,'ARMED')   # reply to the VEL that crossed the edge
+        self.assertEqual(self.bridge.limit_events,[('tilt',-1)])
+        self.line('ERR STOPPING');self.assertEqual(self.bridge.phase,'FAULT')   # a second one is a real error
+    def test_err_stopping_allowance_expires_with_next_status(self):
+        self.armed();self.line('EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN DIR=-1')
+        self.poll()
+        self.line(state('STOPPING',1,torque='1,1',mode=self.mode,t=20))
+        self.line('ERR STOPPING');self.assertEqual(self.bridge.phase,'FAULT')
+    def test_limit_events_that_are_still_faults(self):
+        for line in ['EVENT LIMIT DISARMED ZERO_REQUESTED','EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=YAW DIR=+1']:
+            self.setUp();self.armed();self.line(line)
+            self.assertEqual(self.bridge.phase,'FAULT');self.assertEqual(self.io.tx[-1],'DISARM')
+        self.setUp();self.prepared();self.line('EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN DIR=+1')
+        self.assertEqual(self.bridge.phase,'FAULT')   # only legitimate while ARMED
     def test_close_disarms_and_closes(self):
         self.prepared();self.bridge.close();self.assertTrue(self.io.closed)
         self.assertEqual(self.io.tx[-1],'DISARM')

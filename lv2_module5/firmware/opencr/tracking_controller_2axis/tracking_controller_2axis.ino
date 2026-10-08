@@ -6,9 +6,13 @@
 //
 // 이 계층의 책임 (Pi의 control_node는 P제어·방향·속도 상한·deadband·상태·target timeout 담당)
 //   - 단위 변환: rad/s → Goal_Velocity 원시 단위(0.229 rpm). 부호는 이미 모터 원시 부호 (방향 재적용 없음)
-//   - 속도 상한: |VEL| > MAX_RAD_S(0.05) → ERR RANGE, 두 값 중 하나라도 잘못되면 둘 다 거부
-//   - 각도 경계: 실제 엔코더 위치 기준. 중립 ±STOP_COUNTS에서 바깥 방향 명령 → EVENT LIMIT + 정지(ARM 유지),
-//               ±OUTER_COUNTS 초과 → FAULT (bench 값, 실제 기구 범위 확정 TODO — config/hardware.yaml)
+//   - 속도 상한: |VEL| > MAX_RAD_S(0.5) → ERR RANGE, 두 값 중 하나라도 잘못되면 둘 다 거부
+//               (Pi control_core.MAX_VELOCITY_RAD_S와 같은 값)
+//   - 속도 감시: 실제 속도가 최근 목표 속도 + SPEED_MARGIN(원시 단위)보다 빠르면 FAULT (명령 대비, 고정 절대값 아님)
+//   - 각도 경계: 실제 엔코더 위치 기준. 원점 ±STOP_COUNTS에서 바깥 방향 명령 → 두 축 정지, ARM 유지
+//               "EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN|TILT DIR=+1|-1" (DIR = 막힌 원시 방향).
+//               host(serial_core)는 이를 정상 정지로 처리하고 정지 확인 후 안쪽 명령을 재개한다 (Pan/Tilt 탐색의 반환점).
+//               ±OUTER_COUNTS 초과 → FAULT (실제 기구 범위 확정 TODO — config/hardware.yaml)
 //   - 명령 timeout: ARM 중 마지막 유효 명령 후 COMMAND_MS(300 ms) → 두 축 0 + DISARM (토크 유지)
 //               → control_node·opencr_node·USB 어느 쪽이 멈춰도 마지막 속도로 계속 돌지 않는다
 //   - 모터 Bus_Watchdog: BUS_TICKS(10 × 20 ms = 200 ms) 동안 버스 패킷이 없으면 모터 스스로 정지 (보드 멈춤 대비)
@@ -46,15 +50,23 @@ extern "C" {
 DynamixelWorkbench dxl;
 const uint8_t IDS[2] = {11, 12};  // {Pan, Tilt} — dxl_discovery 스캔으로 확인
 const uint32_t COMMAND_MS = 300, POLL_MS = 20, BUS_TICKS = 10;  // 명령 timeout, 피드백 주기, 모터 watchdog(×20 ms)
-const float MAX_RAD_S = 0.10f;
+const float MAX_RAD_S = 0.5f;
 const float RAD_S_PER_UNIT = 0.229f * 6.28318530718f / 60.0f;
-// Velocity input is already motor-native sign: positive pan left, tilt down.
-// Reference pose: manually verified pan=3078, tilt=0 modulo 4096.
+// Velocity input is already motor-native sign (positive = encoder increasing). Which way that turns the camera
+// depends on assembly; the host's control.yaml *_direction is the only place the image-to-motor sign is chosen.
+// With ACCEPT_STATIONARY_POSE_AS_ORIGIN the stationary pose at CHECK is the origin; PAN/TILT_NEUTRAL are used otherwise.
 const int32_t PAN_NEUTRAL = 1043;
 const int32_t TILT_NEUTRAL = 2161;
 const int32_t NEUTRAL_TOL_COUNTS = 100;
-const int32_t STOP_COUNTS[2] = {1345, 662};
+// OUTER = requested Pan ±120° / Tilt ±60° (rounded inward). STOP is STOP_MARGIN_COUNTS inside it: at 0.5 rad/s the
+// axis can travel ≈7 counts between 20 ms polls plus ≈22 counts while decelerating (PROFILE_ACCEL 10) after the stop.
 const int32_t OUTER_COUNTS[2] = {1365, 682};
+const int32_t STOP_MARGIN_COUNTS = 60;
+const int32_t STOP_COUNTS[2] = {OUTER_COUNTS[0] - STOP_MARGIN_COUNTS, OUTER_COUNTS[1] - STOP_MARGIN_COUNTS};  // 1305, 622
+// Profile_Acceleration unit 214.577 rev/min² ≈ 0.3745 rad/s². 10 → ≈3.7 rad/s²: 0.5 rad/s stops in ≈0.13 s (≈22 counts).
+// Value 1 needed ≈1.3 s, beyond the 500 ms stop check and the stop margin.
+const int32_t PROFILE_ACCEL = 10;
+const int32_t SPEED_MARGIN = 3;              // raw units (≈0.07 rad/s) of feedback noise/overshoot over the recent goal
 const int32_t HOLD_DRIFT_COUNTS = 50;
 const int32_t ARM_POSE_TOLERANCE_COUNTS = 120;
 #ifndef ACCEPT_STATIONARY_POSE_AS_ORIGIN
@@ -69,6 +81,7 @@ int32_t origin[2] = {PAN_NEUTRAL, TILT_NEUTRAL},
         previous[2] = {0, 0},
         goal[2] = {0, 0};
 int32_t holdAnchor[2] = {0, 0};
+int32_t speedCap[2] = {0, 0};   // largest |goal| the motor may still be moving at (tightens once it settles)
 uint32_t lastCommand = 0, lastPoll = 0, sampleAt = 0, stopAt = 0;
 uint8_t quiet = 0;
 char line[64];
@@ -120,8 +133,20 @@ bool goals(int32_t p, int32_t t) {
   if (!a) { fail("PAN_WRITE"); return false; }
   if (!verified(1,"Goal_Velocity",t)) { fail("TILT_WRITE"); return false; }
 #endif
-  goal[0]=p; goal[1]=t;
+  const int32_t next[2]={p,t};
+  for(uint8_t i=0;i<2;++i) {
+    const int32_t m=next[i]<0?-next[i]:next[i];
+    if(m>speedCap[i])speedCap[i]=m;
+    goal[i]=next[i];
+  }
   return true;
+}
+// Stop both axes at an edge; ARM is kept so the host can continue inward after the stop completes.
+void limitStop(uint8_t axis, int32_t outwardSign) {
+  char out[96];
+  snprintf(out,sizeof(out),"EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=%s DIR=%s",
+           axis==0?"PAN":"TILT", outwardSign>0?"+1":"-1");
+  stopBoth(false,out);
 }
 int32_t neutralOffset(int32_t p) {
   int32_t x=p%4096; if(x<0)x+=4096; if(x>=2048)x-=4096; return x;
@@ -149,7 +174,11 @@ bool feedback() {
       const int64_t step=(int64_t)pos[i]-previous[i];
       if(d<=-OUTER_COUNTS[i] || d>=OUTER_COUNTS[i]) { fail("OUTER_BOUND"); return false; }
       if(step>30 || step< -30) { fail("POSITION_DISCONTINUITY"); return false; }
-      if(vel[i]>5 || vel[i]< -5) { fail("UNEXPECTED_SPEED"); return false; }
+      if(vel[i]>speedCap[i]+SPEED_MARGIN || vel[i]< -(speedCap[i]+SPEED_MARGIN)) {
+        fail("UNEXPECTED_SPEED"); return false;
+      }
+      // Settled near the current goal: tighten the cap from the previous (faster) goal to this one.
+      if(vel[i]-goal[i]<=2 && goal[i]-vel[i]<=2) speedCap[i]=goal[i]<0?-goal[i]:goal[i];
       if(holding && !stopping && goal[i]==0) {
         const int64_t h=(int64_t)pos[i]-holdAnchor[i];
         if(h>HOLD_DRIFT_COUNTS || h< -HOLD_DRIFT_COUNTS) { fail("HOLD_DRIFT"); return false; }
@@ -231,7 +260,7 @@ void hold() {
      !eq(0,"Bus_Watchdog",0)||!eq(1,"Bus_Watchdog",0)) {fail("HOLD_PRECHECK");return;}
   if(!goals(0,0))return;
   for(uint8_t i=0;i<2;++i) {
-    if(!verified(i,"Profile_Acceleration",1) || !verified(i,"Bus_Watchdog",BUS_TICKS)) {
+    if(!verified(i,"Profile_Acceleration",PROFILE_ACCEL) || !verified(i,"Bus_Watchdog",BUS_TICKS)) {
       fail("HOLD_CONFIG");return;
     }
   }
@@ -290,7 +319,7 @@ void service() {
     for(uint8_t i=0;i<2;++i) {
       int64_t d=relativePosition(i,pos[i]);
       if((d>=STOP_COUNTS[i] && goal[i]>0)||(d<=-STOP_COUNTS[i] && goal[i]<0)) {
-        stopBoth(false,"EVENT LIMIT STOPPED ZERO_REQUESTED");break;
+        limitStop(i,goal[i]>0?1:-1);break;
       }
     }
   }
@@ -346,7 +375,7 @@ void command(const char *s) {
     for(uint8_t i=0;i<2;++i) {
       const int64_t d=relativePosition(i,pos[i]);
       if((d>=STOP_COUNTS[i] && next[i]>0)||(d<=-STOP_COUNTS[i] && next[i]<0)) {
-        stopBoth(false,"EVENT LIMIT STOPPED ZERO_REQUESTED");return;
+        limitStop(i,next[i]>0?1:-1);return;   // no ACK VEL: the event answers this VEL
       }
     }
     lastCommand=millis(); // Bus latency counts toward 300 ms, not added afterward.

@@ -1,0 +1,21 @@
+# ROS 2 bag 기록·재생 설정 (문제 5) — 사람과 tools/bag_tool.py가 읽는다 (노드는 읽지 않음)
+# 사용: tools/bag_record.sh, tools/bag_replay.sh → tools/bag_tool.py topics|check
+# 절차: docs/ROS 2 bag 구현 가이드 문제 5.md, recordings/README.md
+#
+# 카메라 토픽 이름은 여기 적지 않는다. Source of Truth는 camera.yaml (perception_node·launch와 같은 값).
+camera_config: ../ros2_ws/src/realsense_tracker/config/camera.yaml   # 이 파일 기준 상대 경로
+
+storage: mcap                 # ros2 bag record -s (Jazzy 이후 기본값). 환경 변수 BAG_STORAGE로 바꿀 수 있음
+duration_sec: {min: 10, max: 30}   # 발제: 대표 성공·소실 장면 각각 10~30 s
+min_rate_ratio: 0.9           # 기록 메시지 수 < 기대(rate_hz × 기간) × 이 값 → 경고 (저장 속도·부하 확인)
+bytes_per_sec_estimate: 28000000   # 640×480 rgb8 30 fps ≈ 27.6 MB/s — 저장 공간 사전 확인용
+
+# use: record = 기록, reprocess = A 입력 재처리에서 재생, reanalysis = B 결과 재분석에서 재생
+topics:
+  - {camera: color_topic,       type: sensor_msgs/msg/Image,      rate_hz: 30,  required: true,  use: [record, reprocess]}
+  - {camera: camera_info_topic, type: sensor_msgs/msg/CameraInfo, rate_hz: 30,  required: true,  use: [record, reprocess]}
+  - {name: /target,               type: geometry_msgs/msg/PointStamped,                  rate_hz: 30,  required: true,  use: [record, reanalysis]}
+  - {name: /tracking_status,      type: std_msgs/msg/String,                             rate_hz: 20,  required: true,  use: [record, reanalysis]}
+  - {name: /control/pan_tilt_cmd, type: realsense_tracker_interfaces/msg/PanTiltCommand, rate_hz: 20,  required: true,  use: [record, reanalysis]}
+  - {name: /opencr/bridge_status, type: std_msgs/msg/String,                             rate_hz: 100, required: false, use: [record]}
+# 기록하지 않는 것: 정렬 깊이(검출은 컬러만 사용, 용량 약 1.7배), /perception/debug_image(용량 2배, 재처리로 다시 만들 수 있음)

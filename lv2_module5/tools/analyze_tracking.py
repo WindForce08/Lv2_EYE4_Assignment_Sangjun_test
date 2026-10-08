@@ -85,7 +85,7 @@ def plot(rows, out):
     ax[1].plot(t, [num(r["pan_command"]) for r in rows], label="pan")
     ax[1].plot(t, [num(r["tilt_command"]) for r in rows], label="tilt")
     ax[1].set_ylabel("command [rad/s]"); ax[1].legend(); ax[1].grid(True)
-    states = {"IDLE": 0, "LOST": 1, "TRACKING": 2}
+    states = {"IDLE": 0, "LOST": 1, "SEARCHING": 2, "TRACKING": 3}
     ax[2].step(t, [states.get(r["state"], float("nan")) for r in rows], where="post")
     ax[2].set_yticks(list(states.values()), list(states.keys())); ax[2].set_xlabel("time [s]"); ax[2].grid(True)
     fig.suptitle(rows[0]["run_id"] + " (command values are not measured motor motion)")

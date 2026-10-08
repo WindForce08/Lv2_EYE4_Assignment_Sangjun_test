@@ -13,10 +13,13 @@
   results/logs/perception/eval_<scene>_<시각>.csv                    프레임 목록 + 노드 출력 + 사람 판정 칸(human_ok)
   results/logs/perception/eval_runs.csv                              실행 기록 (조건·설정·처리 FPS)
 판정: CSV의 human_ok 칸에 1(노드 출력이 맞음) 또는 0(틀림)을 적은 뒤 → python3 tools/eval_score.py <CSV들>
+bag 입력 재처리 이미지 (문제 5): --output-dir를 주면 그 폴더에 이미지·CSV를 저장하고 eval_runs.csv에는 쓰지 않는다
+  (사람 대조 평가 세트와 섞이지 않게). tools/bag_replay.sh reprocess --images N이 사용한다.
 """
 import argparse
 import csv
 import time
+from pathlib import Path
 
 import cv2
 import rclpy
@@ -45,6 +48,7 @@ def main():
     ap.add_argument("--no-view", action="store_true", help="확인 창 없이 바로 저장 시작")
     ap.add_argument("--target-topic", default="/target",
                     help="검출 결과 토픽 (bag 입력 재처리 이미지를 저장할 때는 /target_replay)")
+    ap.add_argument("--output-dir", help="저장 폴더 (bag 재처리 이미지용). 주면 eval_runs.csv에 기록하지 않음")
     args = ap.parse_args()
     view = not args.no_view
     n_frames = args.frames or DEFAULTS[args.scene][0]
@@ -53,8 +57,12 @@ def main():
 
     cam, params = load_camera(), load_params()
     run_id = f"{args.scene}_{time.strftime('%Y%m%d_%H%M%S')}"
-    img_dir = RESULTS / "images" / "evaluation" / run_id
-    log_dir = RESULTS / "logs" / "perception"
+    if args.output_dir:
+        img_dir = log_dir = Path(args.output_dir).resolve()
+    else:
+        img_dir = RESULTS / "images" / "evaluation" / run_id
+        log_dir = RESULTS / "logs" / "perception"
+    rel = lambda p: p.relative_to(LV2) if p.is_relative_to(LV2) else p
 
     rclpy.init()
     node = rclpy.create_node("eval_frames")
@@ -93,7 +101,7 @@ def main():
         p = target.point
         rows.append({"scene": args.scene, "idx": idx, "time_s": f"{now - st['start']:.2f}",
                      "stamp": f"{target.header.stamp.sec}.{target.header.stamp.nanosec:09d}",
-                     "raw_image": str(raw_path.relative_to(LV2)), "det_image": str(det_path.relative_to(LV2)),
+                     "raw_image": str(rel(raw_path)), "det_image": str(rel(det_path)),
                      "node_detected": int(p.z > 0), "ex": f"{p.x:.4f}", "ey": f"{p.y:.4f}",
                      "area_ratio": f"{p.z:.5f}", "human_ok": "", "note": ""})
         print(f"  {idx:2d}/{n_frames}  t={now - st['start']:5.2f}s  "
@@ -148,6 +156,9 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
+    if args.output_dir:  # bag 재처리 이미지: 사람 대조 평가 실행 목록(eval_runs.csv)에 넣지 않음
+        print(f"\n저장 완료: {len(rows)}장 → {rel(img_dir)} (/target 수신 {target_rate:.1f} Hz)")
+        return
     runs_path = log_dir / "eval_runs.csv"
     new = not runs_path.exists()
     with open(runs_path, "a", newline="", encoding="utf-8") as f:

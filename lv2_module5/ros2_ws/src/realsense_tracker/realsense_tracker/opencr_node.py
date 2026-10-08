@@ -16,7 +16,9 @@ LIVE에서도 자동 동작은 없다
   /opencr/prepare   std_srvs/Trigger  CHECK → HOLD (중립 자세 확인 후 영속도로 토크 ON)
   /opencr/arm       std_srvs/Trigger  READY + 신선한 stop=false 명령일 때 ARM
   /opencr/disarm    std_srvs/Trigger  영속도 + 구동 허가 해제 (토크 유지 — Tilt 낙하 방지)
-  /opencr/bridge_status std_msgs/String(JSON)  phase, 최초 FAULT 원인, 보드 STATE 캐시
+  /opencr/bridge_status std_msgs/String(JSON)  phase, 최초 FAULT 원인, 보드 STATE 캐시, 경계 정지 횟수
+  /opencr/limit     std_msgs/String  보드 경계 정지 1건마다 "pan:+1" 형식 (축:막힌 원시 방향). ARM은 유지된다.
+                    control_node가 받아 탐색 방향을 바꾸거나 추적 중 범위 초과로 판단한다 (reliable, depth 10)
   FAULT 후 자동 재ARM·자동 재연결 없음. 노드 종료 시 DISARM을 한 번 보낸다.
   토크 해제(SUPPORTED_OFF)는 카메라를 손으로 지지한 뒤 별도 절차로만 한다 (README 참고).
 
@@ -68,6 +70,7 @@ class SerialNode(Node):
                 self.writer = csv.writer(self.file, lineterminator='\n')
                 self.writer.writerow(['monotonic_sec', 'direction', 'line'])
             self.status = self.create_publisher(String, '/opencr/bridge_status', 1)
+            self.limit_pub = self.create_publisher(String, '/opencr/limit', 10)  # 이벤트는 하나도 잃으면 안 됨
             self.sub = self.create_subscription(PanTiltCommand, '/control/pan_tilt_cmd', self.command, 1)
             self.prepare_service = self.create_service(Trigger, '/opencr/prepare', self.prepare)
             self.arm_service = self.create_service(Trigger, '/opencr/arm', self.arm)
@@ -112,6 +115,12 @@ class SerialNode(Node):
 
     def tick(self):
         self.link.tick()
+        while self.link.limit_events:
+            axis, sign = self.link.limit_events.pop(0)
+            event = String()
+            event.data = f'{axis}:{sign:+d}'
+            self.limit_pub.publish(event)
+            self.get_logger().info(f'board limit stop {event.data} (ARM kept; resume after stop confirmation)')
         msg = String()
         msg.data = json.dumps(self.link.snapshot())
         self.status.publish(msg)

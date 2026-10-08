@@ -11,10 +11,13 @@ RealSense 영상에서 파란색 목표(퍽)를 HSV 색상으로 찾아, 화면 
 | `tools/hsv_tuning.py` | HSV 범위 튜너 (트랙바) → `tracker.yaml`에 저장 |
 | `tools/image_capture.py` | 정상·미검출·가림 장면 검출 결과 저장 → `results/` |
 | `tools/common.py` | 도구 공통 (경로, 설정 읽기, RealSense 카메라) |
-| `tools/eval_frames.py` | 검출률·배경 오검출 평가 프레임 저장 (ROS) → `results/` + 판정 목록 CSV |
+| `tools/eval_frames.py` | 검출률·배경 오검출 평가 프레임 저장 (ROS) → `results/` + 판정 목록 CSV. `--output-dir`: bag 재처리 이미지용(평가 세트와 분리) |
 | `tools/eval_score.py` | 사람이 판정한 CSV로 검출률·배경 오검출 집계 |
 | `tools/tracking_logger.py` | 문제 3·4·5: /target·상태·명령을 프레임별 CSV로 기록 (실시간·bag 재분석 공용, ROS) |
 | `tools/analyze_tracking.py` | 문제 3·4·5: 처리 FPS·RMSE·유효 추적 비율·소실/복귀 구간·그래프 (ROS 없음) |
+| `tools/bag_record.sh` | 문제 5: bag 기록 + 실제 파라미터·info·메시지 수 확인·sha256 → `recordings/<RUN>/` (Pi, ROS) |
+| `tools/bag_replay.sh` | 문제 5: 모터 OFF 확인 후 A 입력 재처리 / B 결과 재분석 → CSV·로그·자동 대조 (ROS) |
+| `tools/bag_tool.py` | 문제 5: 기록 토픽 목록, bag 확인(`check`), CSV 프레임 대조(`compare`) (ROS 없음, `config/bag.yaml`) |
 
 검출 순서: 영상 → 블러 → HSV 변환 → 색 마스크 → 잡음 제거 → 외곽선 → **가장 큰 덩어리 1개 선택** → 중심 계산
 

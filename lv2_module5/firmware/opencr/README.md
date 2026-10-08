@@ -45,6 +45,17 @@ python3 -u "$REPO/lv2_module5/firmware/opencr/tests/test_2axis_dry.py" --port "$
 
 ## 3. LIVE 빌드와 단일 명령 방향 시험
 
+> **2026-10-08 펌웨어 변경 (추적 0.5 rad/s, 탐색용 경계 정지) — 보드의 이전 LIVE 펌웨어는 다시 빌드·업로드해야 한다.**
+> | 항목 | 이전 | 현재 | 이유 |
+> |---|---|---|---|
+> | `MAX_RAD_S` | 0.10 rad/s | 0.5 rad/s | 추적 속도 요구 0.5 rad/s (호스트 `MAX_VELOCITY_RAD_S`와 같음) |
+> | 속도 감시 | 절대 5단위(≈0.12 rad/s) | 최근 목표 \|goal\| + 3단위 | 0.5 rad/s(21단위) 정상 추적이 `FAULT UNEXPECTED_SPEED`가 되지 않게 |
+> | `Profile_Acceleration` | 1 (≈0.37 rad/s²) | 10 (≈3.7 rad/s²) | 0.5 rad/s 정지 ≈1.3 s → ≈0.13 s (500 ms 정지 확인·경계 여유 안) |
+> | 경계 정지 | Pan ±1345 / Tilt ±662, 이벤트에 축 정보 없음 | Pan ±1305 / Tilt ±622 (OUTER − 60), `EVENT LIMIT STOPPED ZERO_REQUESTED AXIS=PAN\|TILT DIR=±1` | 0.5 rad/s에서 정지 거리 여유, 호스트 탐색 반환점·bridge 정상 정지 처리 |
+>
+> 근거: host 시험(`tests/test_integrated_native.cpp` — 축·방향 이벤트, 경계 후 `ERR STOPPING`·재개, 0.5 rad/s, 명령 초과 속도 FAULT), DRY PTY,
+> 모터 물리 모델 폐루프 시뮬레이션(경계 넘은 거리 최대 27 counts < 여유 60). **실제 LIVE 동작은 미확인** — 처음에는 속도 상한을 낮춰 방향·경계부터 확인한다.
+
 사전조건: 2절 통과. 카메라를 받칠 사람이 옆에 있음. 두 축을 중립(Pan 3078±20, Tilt 0 mod 4096 ±20) 부근에 둠.
 전원·reset은 토크를 풀 수 있으므로 내내 지지한다. DYNAMIXEL 모드를 바꾸지 않는다. DRY와 다른 빌드 폴더를 쓴다.
 

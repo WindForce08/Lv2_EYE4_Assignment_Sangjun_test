@@ -2,7 +2,10 @@
 
 | 파일 | 만드는 방법 | 내용 |
 |---|---|---|
-| `<run_id>.csv` | `tools/tracking_logger.py --run-id <run_id>` | /target 프레임마다 ex·ey·면적비·상태·명령 (실시간 또는 bag 재분석) |
+| `<run_id>.csv` | `tools/tracking_logger.py --run-id <run_id>` | /target 프레임마다 ex·ey·면적비·상태·명령 (실시간) |
+| `<run_id>_reanalysis.csv` | `tools/bag_replay.sh reanalysis` | 문제 5 B: bag의 저장된 /target·상태·명령을 같은 기록기로 다시 기록 |
+| `<run_id>_reprocess.csv` | `tools/bag_replay.sh reprocess` | 문제 5 A: bag 영상을 검출기에 다시 넣은 `/target_replay` (상태·명령 열은 비어 있음) |
+| `<run_id>_serial.csv` | opencr_node `csv_path` (Pi `~/runs/`에서 복사) | 같은 실행의 시리얼 송수신. Pi 단조 시계 — bag 시각과 빼서 지연을 계산하지 않음 |
 | `recovery_trials.csv` | 사람이 영상·CSV를 보고 작성 | 2초 가림 5회: 가림 시작·재등장·TRACKING 복귀 시각, 복구 시간, 성공 여부 |
 | `interruption_trials.csv` | 사람이 시리얼 CSV·관찰로 작성 | `/target` 중단, 제어 통신 중단: 중단 시각, 정지 확인 시각, 정지 주체(control/bridge/board) |
 

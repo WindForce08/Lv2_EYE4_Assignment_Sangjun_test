@@ -20,7 +20,7 @@ DYNAMIXEL 2개(Pan = 좌우, Tilt = 상하)를 P 제어하는 **Pan/Tilt 2축 �
 | 1 | HSV·Contour 검출, 정규화 중심 오차 ex/ey, 면적비, 미검출 처리 | `perception_node`, 정상·없음·가림 이미지, 30/10 프레임 사람 대조 |
 | 2 | `/target`(PointStamped) 인터페이스, 모터 출력 없는 7개 모의 입력 | `control_node`, `test_control_dry` |
 | 3 | Pan/Tilt 2축 P 제어, 방향·속도·각도 제한·deadband, Kp A/B × 3회 | `control.yaml`, 추적 CSV·그래프 |
-| 4 | IDLE/TRACKING/LOST, 미검출·입력 timeout·통신 중단 정지, 3프레임 복귀, 지표 | `tracking_logger.py`, `analyze_tracking.py`, 펌웨어 watchdog |
+| 4 | IDLE/TRACKING/LOST/SEARCHING, 미검출·입력 timeout·통신 중단 정지, 3프레임 복귀, 목표가 없을 때 탐색(선택 심화), 지표 | `tracking_logger.py`, `analyze_tracking.py`, 펌웨어 watchdog |
 | 5 | bag 기록, 입력 재처리(`/target_replay`), 결과 재분석, 팀원 재현 | `recordings/README.md` |
 
 요구사항별 구현·검증 상태: [docs/requirements_traceability.md](docs/requirements_traceability.md)
@@ -37,7 +37,7 @@ DYNAMIXEL 2개(Pan = 좌우, Tilt = 상하)를 P 제어하는 **Pan/Tilt 2축 �
                               ▼
                            perception_node ── /target  geometry_msgs/PointStamped (x=ex, y=ey, z=area_ratio)
                               ▼                 QoS best effort, depth 1
-                           control_node ───── /tracking_status  std_msgs/String (IDLE/TRACKING/LOST)
+                           control_node ───── /tracking_status  std_msgs/String (IDLE/TRACKING/LOST/SEARCHING)
                               │                 /control/pan_tilt_cmd  PanTiltCommand (rad/s, 20 Hz)
                               ▼
                            opencr_node ──USB Serial 115200──▶ OpenCR (tracking_controller_2axis)
@@ -51,8 +51,8 @@ DYNAMIXEL 2개(Pan = 좌우, Tilt = 상하)를 P 제어하는 **Pan/Tilt 2축 �
 |---|---|---|
 | 인지 | `realsense_tracker/detector.py`, `perception_node.py` | HSV·Contour, ex/ey/area_ratio, 미검출 z=0, 원본 영상 시각 유지 |
 | 제어 | `control_core.py`, `control_node.py` | 신선도·timeout(0.5 s), 상태, P 제어, direction(한 곳), 속도 상한, deadband, 3프레임 복귀 |
-| bridge | `serial_core.py`, `opencr_node.py`, `dry_bridge.py` | ROS→시리얼, DRY/LIVE 모드 검사, 명령 나이 0.15 s, 명시적 prepare/arm, FAULT 래치 |
-| 펌웨어 | `firmware/opencr/tracking_controller_2axis/` | 단위 변환, 0.05 rad/s 상한, 엔코더 경계, 명령 timeout 300 ms, 모터 Bus_Watchdog 200 ms |
+| bridge | `serial_core.py`, `opencr_node.py`, `dry_bridge.py` | ROS→시리얼, DRY/LIVE 모드 검사, 명령 나이 0.15 s, 명시적 prepare/arm, 보드 경계 정지를 정상 정지로 처리하고 `/opencr/limit` 발행, FAULT 래치 |
+| 펌웨어 | `firmware/opencr/tracking_controller_2axis/` | 단위 변환, 0.5 rad/s 상한, 명령 대비 속도 감시, 엔코더 경계(두 축 정지·ARM 유지), 명령 timeout 300 ms, 모터 Bus_Watchdog 200 ms |
 
 인터페이스·상태·timeout 상세: [docs/control_interface.md](docs/control_interface.md) · 디렉토리·담당: [directory_workflow_guide.md](directory_workflow_guide.md) · 팀 네비게이터: [팀업무_네비게이터.md](팀업무_네비게이터.md)
 
@@ -107,7 +107,7 @@ TODO(Pi): D435를 Pi USB 3에 연결한 상태에서 USB 속도·토픽·처리 
 | 원시 + 방향 | Pan 좌측, Tilt 아래쪽 (카메라 뒤에서 정면 기준) | pan/tilt_commission test_notes |
 | USB 시리얼 | `/dev/serial/by-id/usb-ROBOTIS_OpenCR_Virtual_ComPort_in_FS_Mode_FFFFFFFEFFFF-if00`, 115200 | `docs/hardware.md` |
 | 펌웨어 | `tracking_controller_2axis` (기본 MODE=DRY, LIVE는 컴파일 플래그) | [firmware/opencr/README.md](firmware/opencr/README.md) |
-| 안전 상수 | 0.05 rad/s, 명령 timeout 300 ms, Bus_Watchdog 200 ms, 경계 ±80/±100 counts | `config/hardware.yaml` |
+| 안전 상수 | 0.5 rad/s, 명령 timeout 300 ms, Bus_Watchdog 200 ms, 경계(원점 기준) Pan ±1305 / Tilt ±622 counts 정지, ±1365 / ±682 FAULT, Profile_Acceleration 10 | `config/hardware.yaml` |
 
 > ⚠ Tilt는 토크가 꺼지면 카메라 무게로 내려간다. 토크 해제(SUPPORTED_OFF)·전원 차단·reset 전에는 **항상 카메라를 손으로 지지**한다.
 > 한 번에 한 프로그램만 OpenCR 포트를 사용한다 (opencr_node, miniterm, 시험 스크립트 동시 실행 금지).
@@ -240,7 +240,11 @@ ros2 topic echo /control/pan_tilt_cmd      # 20 Hz, 정지 시 stop: true
 
 사전조건 (12절 1~3 + 아래):
 - `control.yaml` direction이 12절에서 확인된 값, Kp·속도 상한이 test.yaml/report에 기록된 값
-- 추적 범위: 현재 펌웨어 경계는 중립 ±80 counts(약 ±7°). 목표를 이 범위 안에서만 움직인다. 넘으면 EVENT LIMIT → DISARM → bridge FAULT
+- 추적 범위: 펌웨어 경계는 CHECK 때 멈춘 자세 기준 Pan ±1305 / Tilt ±622 counts(≈±115° / ±55°). 경계에 닿으면 보드가 두 축을 멈추고 ARM을 유지한다(`EVENT LIMIT STOPPED`, bridge는 FAULT가 아니라 정상 정지로 처리하고 `/opencr/limit` 발행). **실제 기구 범위는 미확인 — CHECK 전에 카메라를 기구 중앙에 둔다.**
+- 추적 속도 상한 0.5 rad/s, Kp 1.0 (control.yaml). 처음에는 `-p pan_speed_limit_rad_s:=0.2 -p tilt_speed_limit_rad_s:=0.2`처럼 낮춰 방향을 먼저 확인한다.
+- **목표가 없을 때 탐색** (`search_enabled: true`): 놓치면 LOST로 3 s 정지 → Pan·Tilt 전체 범위를 0.4 rad/s로 훑음 → 찾으면 추적, 못 찾으면 정지·IDLE(최대 120 s).
+  추적 중 범위를 넘으면 탐색, 다시 찾은 목표가 또 범위를 넘으면 IDLE(out_of_range) — 안쪽으로 돌아오면 다시 추적. 상태 전이: [docs/control_interface.md 3.1절](docs/control_interface.md).
+  **ARM은 목표가 보여 TRACKING일 때 한다** — SEARCHING 중에 ARM하면 바로 탐색 동작이 시작된다. 탐색을 멈추려면 `/control/enable false`.
 - 실행 ID를 정한다: `RUN=track_01` (bag·시리얼 CSV·tracking CSV에 같은 이름)
 
 ```bash
@@ -258,14 +262,15 @@ ros2 service call /opencr/arm std_srvs/srv/Trigger       # 구동 허가 — 이
 ```
 
 - 한 launch로 opencr_node까지 실행하려면 `start_opencr:=true` (서비스 호출 절차는 같음). 시리얼 로그를 따로 보려면 위처럼 분리 실행을 권장.
-- 목표를 가리면(z=0) 즉시 STOP(ARM 유지) → 다시 보이면 3프레임 후 자동 재개. **자동 ARM은 없다**: FAULT 후에는 15절 재시작 절차.
+- 목표를 가리면(z=0) 즉시 STOP(ARM 유지) → 3 s 안에 다시 보이면 3프레임 후 자동 재개, 3 s 넘게 안 보이면 탐색. **자동 ARM은 없다**: FAULT 후에는 15절 재시작 절차.
+- 상태·경계 확인: `ros2 topic echo /tracking_status` (IDLE/TRACKING/LOST/SEARCHING), `ros2 topic echo /opencr/limit` (경계 정지 `pan:+1` 등).
 - 문제 3·4 기록은 터미널 4에서 `python3 tools/tracking_logger.py --run-id $RUN` (20절).
 
 ## 15. 안전한 종료 방법
 
 | 상황 | 방법 | 결과 |
 |---|---|---|
-| 추적만 멈춤 (정상) | `ros2 service call /control/enable std_srvs/srv/SetBool "{data: false}"` | IDLE, stop=true → 보드 STOP, ARM 유지·토크 유지 |
+| 추적·탐색만 멈춤 (정상) | `ros2 service call /control/enable std_srvs/srv/SetBool "{data: false}"` | IDLE, stop=true → 보드 STOP, ARM 유지·토크 유지 (탐색 취소) |
 | 구동 허가 해제 | `ros2 service call /opencr/disarm std_srvs/srv/Trigger` | 영속도 + DISARM, 토크 유지 |
 | 비상 | 아무 노드나 Ctrl+C / `pkill -f opencr_node` | bridge 0.15 s 또는 펌웨어 300 ms timeout → 두 축 0 + DISARM (토크 유지) |
 | 종료 후 토크 해제 | 아래 순서 | 카메라 지지 후에만 |
@@ -306,43 +311,66 @@ python3 tools/tracking_logger.py --run-id kpA_01            # kpA_01..03, kpB_01
 
 ## 18. bag record
 
-사전조건: Pi 저장 공간 확인(`df -h`). 640×480 rgb8 30 fps 영상만 약 27.6 MB/s → 30 s ≈ 0.8 GB. 기록 중 Pi CPU 부하가 추적에 영향을 주는지 상태 로그로 확인한다.
+사전조건: 14절로 추적이 돌고 있음, opencr_node `csv_path`와 `tracking_logger --run-id`에 같은 `$RUN`. 영상만 약 27.6 MB/s(30 s ≈ 0.8 GB) — 스크립트가 저장 공간을 먼저 확인한다.
+기록 중 Pi CPU 부하로 인지 "처리 FPS" 로그가 떨어지는지 보고, 떨어지면 report에 적는다. SSH 끊김 대비로 `tmux` 안에서 실행한다.
 
 ```bash
-RUN=success_01   # 소실·복귀 장면은 lost_01
-ros2 bag record -o ~/bags/$RUN \
-  /camera/camera/color/image_raw /camera/camera/color/camera_info \
-  /target /tracking_status /control/pan_tilt_cmd /opencr/bridge_status
-ros2 bag info ~/bags/$RUN        # 기간·메시지 수 → recordings/README.md 표에 기록
+tools/bag_record.sh success_01 --duration 20 --archive     # 소실·복귀 장면은 lost_01
 ```
 
-시리얼 로그는 14절 `csv_path`를 같은 `$RUN`으로 지정한다. 대용량 bag은 Git에 올리지 않고 외부 저장소 링크·체크섬을 [recordings/README.md](recordings/README.md)에 적는다.
+스크립트가 하는 일: 필수 토픽 발행 확인 → 실행 중 노드 파라미터 저장(`ros2 param dump`) → `ros2 bag record`(토픽: [config/bag.yaml](config/bag.yaml) + camera.yaml) →
+`ros2 bag info`·메시지 수 판정·파일별 sha256·기준 commit을 `recordings/<RUN>/`에 저장. bag은 `~/bags/<RUN>/`(Git 밖). 결과 정리·업로드: [recordings/README.md](recordings/README.md) 1·3절.
+
+스크립트 없이 같은 기록 (같은 토픽):
+
+```bash
+RUN=success_01
+ros2 bag record -o ~/bags/$RUN -s mcap --topics $(python3 tools/bag_tool.py topics record)
+ros2 bag info ~/bags/$RUN && python3 tools/bag_tool.py check ~/bags/$RUN
+```
 
 ## 19. bag replay
 
-사전조건 — **실제 모터 출력 OFF**: ① `pkill -f opencr_node; pkill -f control_node` ② `ros2 node list`에 opencr_node·control_node가 없음 ③ 격리 도메인:
-`export ROS_DOMAIN_ID=99 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` (재생된 `/control/pan_tilt_cmd`가 실제 bridge에 닿지 않게 함. 닿더라도 bridge는 오래된 시각 명령을 거부한다.)
+사전조건 — **실제 모터 출력 OFF** (스크립트가 ①~③을 확인하고 하나라도 어긋나면 거부한다):
+① 카메라를 지지하고 OpenCR USB를 뽑거나 모터 전원 OFF ② opencr_node·control_node 종료 ③ 격리 도메인 `ROS_DOMAIN_ID=99 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+(재생된 `/control/pan_tilt_cmd`가 실제 bridge에 닿지 않게 함. 닿더라도 bridge는 오래된 시각 명령을 거부한다.)
 
-**A. 입력 재처리** — bag 영상만 검출기에 다시 넣고 새 결과를 `/target_replay`로 분리:
+```bash
+tools/bag_replay.sh reanalysis ~/bags/$RUN                   # B. 결과 재분석 → ${RUN}_reanalysis.csv, 실시간 ${RUN}.csv와 대조
+tools/bag_replay.sh reprocess  ~/bags/$RUN                   # A. 입력 재처리 → ${RUN}_reprocess.csv, ${RUN}_reanalysis.csv와 대조
+tools/bag_replay.sh reprocess  ~/bags/$RUN --images 10 --suffix _img   # 재처리 이미지 → results/images/replay/
+```
+
+스크립트 없이 같은 재현 (모든 터미널에서 ③의 export):
+
+**A. 입력 재처리** — bag 영상만 검출기에 다시 넣고 새 결과를 `/target_replay`로 분리. 기록 당시 실제 파라미터(`recordings/$RUN/params/perception_node.yaml`, 없으면 `$CFG/tracker.yaml`)를 쓴다.
 
 ```bash
 # 터미널 1
-ros2 run realsense_tracker perception_node --ros-args --params-file $CFG/tracker.yaml \
+ros2 run realsense_tracker perception_node --ros-args --params-file recordings/$RUN/params/perception_node.yaml \
   -p camera_config:=$CFG/camera.yaml -p use_depth:=false -p use_sim_time:=true -p publish_debug_image:=true \
   -r /target:=/target_replay
 # 터미널 2 (기록: 재처리 결과)
 python3 tools/tracking_logger.py --run-id ${RUN}_reprocess --target-topic /target_replay --ros-args -p use_sim_time:=true
-# 터미널 3
-ros2 bag play ~/bags/$RUN --clock --topics /camera/camera/color/image_raw /camera/camera/color/camera_info
+# 터미널 3 — rate 0.5: 검출기가 프레임을 놓치지 않게, delay 2: 구독 연결 대기
+ros2 bag play ~/bags/$RUN --clock --delay 2 --rate 0.5 --topics $(python3 tools/bag_tool.py topics reprocess)
 ```
 
-재처리 이미지: 터미널 2 대신 `python3 tools/eval_frames.py --scene visible --target-topic /target_replay --no-view --note "replay $RUN"`.
+재처리 이미지: 터미널 2 대신 `python3 tools/eval_frames.py --scene visible --target-topic /target_replay --no-view --frames 10 --duration 8 --output-dir results/images/replay/${RUN}_reprocess_img`
+(`--output-dir`를 주면 사람 대조 평가 세트·`eval_runs.csv`와 섞이지 않는다).
 
 **B. 결과 재분석** — 저장된 `/target`·상태·명령으로 지표를 같은 코드로 다시 계산:
 
 ```bash
 python3 tools/tracking_logger.py --run-id ${RUN}_reanalysis --ros-args -p use_sim_time:=true
-ros2 bag play ~/bags/$RUN --clock --topics /target /tracking_status /control/pan_tilt_cmd
+ros2 bag play ~/bags/$RUN --clock --delay 2 --topics $(python3 tools/bag_tool.py topics reanalysis)
+```
+
+대조 (원본 영상 시각 `stamp_ns`로 프레임을 맞춤 — perception은 입력 영상 header를 그대로 복사):
+
+```bash
+python3 tools/bag_tool.py compare results/logs/verification/$RUN.csv            results/logs/verification/${RUN}_reanalysis.csv --state
+python3 tools/bag_tool.py compare results/logs/verification/${RUN}_reanalysis.csv results/logs/verification/${RUN}_reprocess.csv
 ```
 
 ## 20. Result analysis
@@ -354,6 +382,7 @@ python3 tools/eval_score.py results/logs/perception/eval_visible_*.csv results/l
 ```
 
 같은 run의 실시간 CSV(`success_01.csv`)와 재분석 CSV(`success_01_reanalysis.csv`)를 같은 명령으로 계산해 차이를 report 문제 5에 적는다.
+프레임 단위 일치는 `tools/bag_tool.py compare`(19절). 재처리 CSV는 상태·명령이 없어 유효 추적 비율 0 %, RMSE `nan`이 정상이다.
 
 ## 21. results 위치
 
@@ -361,13 +390,17 @@ python3 tools/eval_score.py results/logs/perception/eval_visible_*.csv results/l
 results/
 ├── images/detection/      정상·없음·가림 원본/마스크/검출 (문제 1, 2026-10-06)
 ├── images/evaluation/     사람 대조 평가 프레임 visible 30 / empty 10
+├── images/replay/         bag 입력 재처리 이미지 (bag_replay.sh --images, 문제 5)
 ├── logs/perception/       장면 log.csv, 평가 CSV, perception_node 로그(처리 FPS)
 ├── logs/control/          ROS 제어 DRY·시리얼 bridge 시험 로그 (2026-10-06, Pi)
 ├── logs/opencr/           모터 스캔·상태 조회·축별 commission·2축 LIVE 단일 명령 시험
-├── logs/verification/     tracking_logger CSV, recovery_trials.csv, interruption_trials.csv (현재 템플릿만)
+├── logs/verification/     tracking_logger CSV(<RUN>, <RUN>_reanalysis, <RUN>_reprocess), 시리얼 CSV, recovery·interruption trials
+├── logs/replay/           bag 재현 실행 기록: run.txt·노드 로그·analyze·compare (bag_replay.sh, 문제 5)
 ├── plots/                 analyze_tracking.py 그래프 (현재 없음)
 └── metrics.csv            요약 지표 (실측값만, 출처 열 포함)
 ```
+
+bag 자체는 Git 밖(`~/bags`, 공유 드라이브). bag 증거(메타데이터·체크섬·실제 파라미터)는 `recordings/<RUN>/`.
 
 ## 22. 현재 미검증 항목 (HARDWARE VERIFICATION TODO)
 
@@ -379,7 +412,8 @@ results/
 | Pan/Tilt ID 11/12, 1 Mbps, Protocol 2.0, 시리얼 경로 | VERIFIED 2026-10-06 (scan.log, hardware.md) — 장비 교체 시 재확인 |
 | 원시 명령 방향 (Pan + 좌, Tilt + 아래) | VERIFIED (commission·LIVE 단일 명령) |
 | 폐루프 영상 오차 감소 방향 (direction −1/+1) | NOT VERIFIED |
-| 실제 기구 안전 회전 범위 (현재 ±80/±100 counts bench 값) | NOT VERIFIED |
+| 실제 기구 안전 회전 범위 (현재 경계 Pan ±1305 / Tilt ±622 counts는 요청 범위, 측정 근거 없음) | NOT VERIFIED |
+| 2026-10-08 탐색(SEARCHING)·경계 정지 ARM 유지·0.5 rad/s 추적의 실제 LIVE 동작 | NOT VERIFIED — 단위 시험, 펌웨어 host 시험, DRY PTY, 모터 물리 모델 폐루프 시뮬레이션만 |
 | Kp A/B 값, 속도 상한 최종값 | NOT DECIDED (test.yaml null) |
 | 정상 30 s 추적, 가림 5회, /target 중단, 제어 통신 중단, 복구 시간, RMSE | NOT VERIFIED |
 | opencr_node LIVE 모드(ROS → 실제 모터) | IMPLEMENTED, NOT VERIFIED (DRY 경로만 실제 보드 시험) |
